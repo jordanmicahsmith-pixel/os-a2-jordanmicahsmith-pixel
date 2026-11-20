@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "pinfo.h"
 
 struct cpu cpus[NCPU];
 
@@ -122,6 +123,12 @@ allocproc(void)
   return 0;
 
 found:
+  p->runticks = 0;
+  p->nsched = 0;
+  p->ctime = ticks;   // no tickslock: lock order is tickslock -> p->lock
+  p->level = 0;
+  p->used = 0;
+
   p->pid = allocpid();
   p->state = USED;
 
@@ -450,6 +457,7 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        p->nsched++;
         swtch(&c->context, &p->context);
 
         // Don't re-enable interrupts on release.
@@ -700,4 +708,49 @@ procdump(void)
     printk("%d %s %s", p->pid, state, p->name);
     printk("\n");
   }
+}
+
+// Called on every timer interrupt for the process that was running.
+// Returns 1 if it should yield. Part 2 will fill in the real policy.
+int
+mlfq_tick(struct proc *p)
+{
+  acquire(&p->lock);
+  p->runticks++;
+  release(&p->lock);
+  return 1;   // same as xv6 today: yield every tick
+}
+
+int
+kgetpinfo(uint64 addr, int max)
+{
+  struct proc *p;
+  struct proc *me = myproc();
+  struct pinfo info;
+  int n = 0;
+
+  if(max < 0)
+    return -1;
+  for(p = proc; p < &proc[NPROC] && n < max; p++){
+    acquire(&p->lock);
+    if(p->state == UNUSED){
+      release(&p->lock);
+      continue;
+    }
+    memset(&info, 0, sizeof(info));
+    info.pid = p->pid;
+    info.state = p->state;
+    info.level = p->level;
+    info.runticks = p->runticks;
+    info.nsched = p->nsched;
+    info.ctime = p->ctime;
+    safestrcpy(info.name, p->name, sizeof(info.name));
+    release(&p->lock);          // never copyout while holding p->lock
+
+    if(copyout(myproc()->pagetable, me->sz, addr + n * sizeof(info),
+               (char *)&info, sizeof(info)) < 0)
+      return -1;
+    n++;
+  }
+  return n;
 }
