@@ -11,6 +11,9 @@ struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
 
+static int slice[NLEVELS] = {1, 2, 4, 8};
+static int cursor[NLEVELS] = {NPROC-1, NPROC-1, NPROC-1, NPROC-1};  // last slot chosen per level
+
 struct proc *initproc;
 
 int nextpid = 1;
@@ -449,29 +452,31 @@ scheduler(void)
     intr_off();
 
     int found = 0;
-    for (p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        p->nsched++;
-        swtch(&c->context, &p->context);
+    for(int lvl = 0; lvl < NLEVELS && !found; lvl++){
+      for(int i = 1; i <= NPROC; i++){
+        int idx = (cursor[lvl] + i) % NPROC;
+        p = &proc[idx];
 
-        // Don't re-enable interrupts on release.
-        mycpu()->intena = 0;
+        // cheap unlocked peek; everything is re-checked under the lock
+        if(p->state != RUNNABLE || p->level != lvl)
+          continue;
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+        acquire(&p->lock);
+        if(p->state == RUNNABLE && p->level == lvl){
+          cursor[lvl] = idx;
+          p->state = RUNNING;
+          c->proc = p;
+          p->nsched++;
+          swtch(&c->context, &p->context);
+          c->proc = 0;
+          found = 1;
+        }
+        release(&p->lock);
+        if(found)
+          break;
       }
-      release(&p->lock);
     }
-    if (found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
+    if(found == 0){
       asm volatile("wfi");
     }
   }
@@ -710,15 +715,48 @@ procdump(void)
   }
 }
 
-// Called on every timer interrupt for the process that was running.
-// Returns 1 if it should yield. Part 2 will fill in the real policy.
+// Called on every timer interrupt for the process p that was running.
+// Returns 1 if p should yield.
 int
 mlfq_tick(struct proc *p)
 {
+  int lvl;
+
   acquire(&p->lock);
   p->runticks++;
-  release(&p->lock);
-  return 1;   // same as xv6 today: yield every tick
+  p->used++;
+  if(p->used >= slice[p->level]){
+    if(p->level < NLEVELS - 1)
+      p->level++;
+    p->used = 0;
+    release(&p->lock);
+    return 1;                 // slice used up: demoted, yield
+  }
+  lvl = p->level;
+  release(&p->lock);          // never hold two p->locks at once
+
+  // Slice not used up: preempt only if a higher level has work.
+  for(struct proc *q = proc; q < &proc[NPROC]; q++){
+    acquire(&q->lock);
+    if(q->state == RUNNABLE && q->level < lvl){
+      release(&q->lock);
+      return 1;
+    }
+    release(&q->lock);
+  }
+  return 0;
+}
+
+// Move every process to level 0. Caller holds tickslock.
+void
+mlfq_boost(void)
+{
+  for(struct proc *p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    p->level = 0;
+    p->used = 0;
+    release(&p->lock);
+  }
 }
 
 int

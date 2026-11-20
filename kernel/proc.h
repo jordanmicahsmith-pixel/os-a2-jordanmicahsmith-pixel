@@ -1,3 +1,5 @@
+#define NLEVELS 4
+
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
